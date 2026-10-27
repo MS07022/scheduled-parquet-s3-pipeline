@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Scheduled S3 Parquet batch pipeline starter.
+Parameters:
+  RawBucket: { Type: String, Description: Existing raw S3 bucket }
+  RawPrefix: { Type: String, Default: raw/ }
+  QuarantineBucket: { Type: String, Description: Existing quarantine S3 bucket }
+  QuarantinePrefix: { Type: String, Default: rejected/ }
+  CuratedBucket: { Type: String, Description: Existing curated S3 bucket }
+  CuratedPrefix: { Type: String, Default: curated/ }
+  GlueScriptUri: { Type: String, Description: S3 URI for uploaded glue/transform.py }
+  NotificationEmail: { Type: String, Default: '', Description: Optional SNS email subscriber }
+  ScheduleExpression: { Type: String, Default: rate(2 hours) }
+  BatchSize: { Type: Number, Default: 300, MinValue: 1, MaxValue: 300 }
+  ClaimTimeoutMinutes: { Type: Number, Default: 180, MinValue: 10 }
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 120
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        STATE_TABLE: !Ref FileStateTable
+        LOCK_TABLE: !Ref RunLockTable
+        CLAIM_TIMEOUT_MINUTES: !Ref ClaimTimeoutMinutes
+Resources:
+  FileStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: object_id, AttributeType: S }]
+      KeySchema: [{ AttributeName: object_id, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+  RunLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: lock_name, AttributeType: S }]
+      KeySchema: [{ AttributeName: lock_name, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+  PipelineTopic:
+    Type: AWS::SNS::Topic
+    Properties: { DisplayName: Parquet pipeline run summary }
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref PipelineTopic
+  DiscoverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/discover/
+      Handler: app.handler
+      Timeout: 300
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FileStateTable }
+        - S3ReadPolicy: { BucketName: !Ref RawBucket }
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          RAW_PREFIX: !Ref RawPrefix
+          BATCH_SIZE: !Ref BatchSize
+  QuarantineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/quarantine/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FileStateTable }
+        - S3ReadPolicy: { BucketName: !Ref RawBucket }
+        - S3WritePolicy: { BucketName: !Ref QuarantineBucket }
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          QUARANTINE_BUCKET: !Ref QuarantineBucket
+          QUARANTINE_PREFIX: !Ref QuarantinePrefix
+  CompleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/complete/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref FileStateTable }
+  SummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/summary/
+      Handler: app.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref RunLockTable }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt PipelineTopic.TopicName }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref PipelineTopic
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: PipelineS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${RawBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${RawBucket}/*
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${CuratedBucket}/*
+  TransformGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${AWS::StackName}-transform
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      ExecutionProperty: { MaxConcurrentRuns: 1 }
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Ref GlueScriptUri
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+  WorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/states/${AWS::StackName}-pipeline
+      RetentionInDays: 30
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        DiscoverArn: !GetAtt DiscoverFunction.Arn
+        QuarantineArn: !GetAtt QuarantineFunction.Arn
+        CompleteArn: !GetAtt CompleteFunction.Arn
+        SummaryArn: !GetAtt SummaryFunction.Arn
+        GlueJobName: !Ref TransformGlueJob
+        RawBucket: !Ref RawBucket
+        CuratedBucket: !Ref CuratedBucket
+        CuratedPrefix: !Ref CuratedPrefix
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref DiscoverFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref QuarantineFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref CompleteFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref SummaryFunction }
+        - Statement:
+            - Effect: Allow
+              Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
+              Resource: !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${TransformGlueJob}
+        - Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery, logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy, logs:DescribeResourcePolicies, logs:DescribeLogGroups]
+              Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets, xray:GetSamplingStatisticSummaries]
+              Resource: '*'
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !Sub "${WorkflowLogGroup.Arn}:*" }
+        IncludeExecutionData: true
+        Level: ALL
+      Tracing: { Enabled: true }
+  ScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt PipelineStateMachine.Arn
+  PipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Starts the S3 batch pipeline on the configured cadence.
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Target:
+        Arn: !GetAtt PipelineStateMachine.Arn
+        RoleArn: !GetAtt ScheduleRole.Arn
+        Input: '{}'
+  FailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm when state machine executions fail.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PipelineStateMachine
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineTopic]
+Outputs:
+  StateMachineArn: { Value: !Ref PipelineStateMachine }
+  SnsTopicArn: { Value: !Ref PipelineTopic }
+  FileStateTableName: { Value: !Ref FileStateTable }
+
+

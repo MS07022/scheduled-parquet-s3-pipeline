@@ -1,0 +1,93 @@
+{
+  "Comment": "Drain new S3 objects in batches up to 300.",
+  "StartAt": "AcquireRunLock",
+  "States": {
+    "AcquireRunLock": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${DiscoverArn}", "Payload": { "action": "acquire_lock", "execution_id.$": "$$.Execution.Id" } },
+      "ResultSelector": { "acquired.$": "$.Payload.acquired", "run_id.$": "$.Payload.run_id" },
+      "ResultPath": "$.lock", "Next": "LockAcquired?"
+    },
+    "LockAcquired?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.lock.acquired", "BooleanEquals": true, "Next": "InitSummary" }],
+      "Default": "AlreadyRunning"
+    },
+    "AlreadyRunning": { "Type": "Succeed" },
+    "InitSummary": {
+      "Type": "Pass",
+      "Parameters": { "run_id.$": "$.lock.run_id", "processed": 0, "quarantined": 0, "batches": 0 },
+      "ResultPath": "$.summary", "Next": "DiscoverBatch"
+    },
+    "DiscoverBatch": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${DiscoverArn}", "Payload": { "action": "discover", "run_id.$": "$.summary.run_id" } },
+      "ResultSelector": { "files.$": "$.Payload.files", "valid.$": "$.Payload.valid", "rejected.$": "$.Payload.rejected" },
+      "ResultPath": "$.batch",
+      "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "States.Timeout"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "FailureSummary" }],
+      "Next": "BatchEmpty?"
+    },
+    "BatchEmpty?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.batch.files[0]", "IsPresent": true, "Next": "QuarantineRejected" }],
+      "Default": "PublishSummary"
+    },
+    "QuarantineRejected": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${QuarantineArn}", "Payload": { "files.$": "$.batch.rejected" } },
+      "ResultSelector": { "count.$": "$.Payload.count" }, "ResultPath": "$.quarantine_result",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "FailureSummary" }],
+      "Next": "HasValidFiles?"
+    },
+    "HasValidFiles?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.batch.valid[0]", "IsPresent": true, "Next": "RunGlue" }],
+      "Default": "UpdateSummary"
+    },
+    "RunGlue": {
+      "Type": "Task", "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${GlueJobName}",
+        "Arguments": {
+          "--source_bucket": "${RawBucket}", "--curated_bucket": "${CuratedBucket}",
+          "--curated_prefix": "${CuratedPrefix}", "--input_keys.$": "States.JsonToString($.batch.valid)"
+        }
+      },
+      "ResultPath": "$.glue_result",
+      "Retry": [{ "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "States.TaskFailed", "States.Timeout"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "FailureSummary" }],
+      "Next": "MarkProcessed"
+    },
+    "MarkProcessed": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${CompleteArn}", "Payload": { "files.$": "$.batch.valid" } },
+      "ResultPath": "$.complete_result",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "FailureSummary" }],
+      "Next": "UpdateSummary"
+    },
+    "UpdateSummary": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.summary.run_id",
+        "processed.$": "States.MathAdd($.summary.processed, States.ArrayLength($.batch.valid))",
+        "quarantined.$": "States.MathAdd($.summary.quarantined, $.quarantine_result.count)",
+        "batches.$": "States.MathAdd($.summary.batches, 1)"
+      },
+      "ResultPath": "$.summary", "Next": "DiscoverBatch"
+    },
+    "PublishSummary": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${SummaryArn}", "Payload": { "summary.$": "$.summary", "status": "SUCCEEDED" } },
+      "End": true
+    },
+    "FailureSummary": {
+      "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${SummaryArn}", "Payload": { "summary.$": "$.summary", "status": "FAILED", "error.$": "$.error" } },
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "PipelineFailed" }],
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": { "Type": "Fail", "Error": "PipelineExecutionFailed", "Cause": "See the SNS summary and Step Functions execution for details." }
+  }
+}
+
