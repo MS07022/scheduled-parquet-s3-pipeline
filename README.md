@@ -30,4 +30,6 @@ The lightweight Parquet check verifies `.parquet` extension and `PAR1` header/fo
 
 ## Architecture diagram
 
-`workflow-architecture.svg` is a self-contained vector diagram using AWS Architecture Icons from the [official icon page](https://aws.amazon.com/architecture/icons/).
+![Scheduled S3 batch pipeline architecture](workflow-architecture.svg)
+
+The self-contained SVG uses AWS Architecture Icons from the [official icon page](https://aws.amazon.com/architecture/icons/).
